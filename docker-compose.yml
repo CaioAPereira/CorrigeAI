@@ -1,0 +1,81 @@
+services:
+  # Nginx — porta de entrada HTTP. Serve estáticos e repassa PHP ao php-fpm.
+  nginx:
+    image: nginx:1.27-alpine
+    container_name: corrigeai-nginx
+    ports:
+      - "8080:80"
+    volumes:
+      - ./src:/var/www/html
+      - ./docker/nginx/default.conf:/etc/nginx/conf.d/default.conf:ro
+    depends_on:
+      - app
+    networks:
+      - corrigeai
+
+  # PHP-FPM — Laravel 11 + Livewire. Não expõe porta: só o nginx fala com ele.
+  app:
+    build:
+      context: .
+      dockerfile: docker/php/Dockerfile
+    container_name: corrigeai-app
+    volumes:
+      - ./src:/var/www/html
+    environment:
+      # Hostnames internos do Docker. "db" e "ocr" resolvem pelo nome do serviço.
+      DB_CONNECTION: pgsql
+      DB_HOST: db
+      DB_PORT: 5432
+      DB_DATABASE: corrigeai
+      DB_USERNAME: corrigeai
+      DB_PASSWORD: secret
+      # URL do leitor óptico na rede interna. O Laravel nunca chama via localhost.
+      OCR_SERVICE_URL: http://ocr:8000
+    depends_on:
+      db:
+        condition: service_healthy
+    networks:
+      - corrigeai
+
+  # PostgreSQL 16 — banco da aplicação. Porta exposta p/ DBeaver etc.
+  db:
+    image: postgres:16-alpine
+    container_name: corrigeai-db
+    ports:
+      - "5432:5432"
+    environment:
+      POSTGRES_DB: corrigeai
+      POSTGRES_USER: corrigeai
+      POSTGRES_PASSWORD: secret
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    # healthcheck: o app só sobe depois que o banco aceita conexão de verdade.
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U corrigeai -d corrigeai"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+    networks:
+      - corrigeai
+
+  # FastAPI + OpenCV — leitor óptico puro. Stateless, sem banco.
+  ocr:
+    build:
+      context: .
+      dockerfile: docker/python/Dockerfile
+    container_name: corrigeai-ocr
+    # Porta exposta SÓ para você testar no /docs durante o desenvolvimento.
+    # Em produção isso sairia: o Laravel fala com ele pela rede interna.
+    ports:
+      - "8000:8000"
+    volumes:
+      - ./ocr-service:/app
+    networks:
+      - corrigeai
+
+networks:
+  corrigeai:
+    driver: bridge
+
+volumes:
+  pgdata:
