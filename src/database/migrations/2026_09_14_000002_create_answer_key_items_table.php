@@ -1,0 +1,26 @@
+<?php
+
+use Illuminate\Database\Migrations\Migration;
+use Illuminate\Database\Schema\Blueprint;
+use Illuminate\Support\Facades\Schema;
+
+return new class extends Migration
+{
+    public function up(): void
+    {
+        Schema::create('answer_key_items', function (Blueprint $table) {
+            $table->id();
+            $table->foreignId('exam_id')->constrained()->cascadeOnDelete();
+            $table->unsignedTinyInteger('question_number');
+            $table->char('correct_option', 1);
+            $table->timestamps();
+
+            $table->unique(['exam_id', 'question_number']);
+        });
+    }
+
+    public function down(): void
+    {
+        Schema::dropIfExists('answer_key_items');
+    }
+};
