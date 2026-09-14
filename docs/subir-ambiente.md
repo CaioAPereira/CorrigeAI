@@ -55,6 +55,57 @@ curl http://localhost:8000/health   # serviço OCR
 | API do leitor óptico (Swagger) | http://localhost:8000/docs |
 | PostgreSQL (DBeaver) | `localhost:5432` — `corrigeai` / `corrigeai` / `secret` |
 
+## 6. Assets front-end (Node/npm)
+
+**Roda no host (WSL2), nunca dentro do container `app`.** O container `app`
+só tem PHP-FPM — não tem Node instalado, e não precisa: o Vite gera arquivos
+estáticos em `public/build/`, que o container já enxerga via volume montado
+do `src/`.
+
+Primeira vez, ou depois de mudar `package.json`:
+
+```bash
+cd ~/CorrigeAI/src
+npm install
+```
+
+Compilar assets (uma vez, gera `public/build/`):
+
+```bash
+npm run build
+```
+
+Durante desenvolvimento ativo (recompila sozinho a cada mudança em `resources/`):
+
+```bash
+npm run dev
+```
+
+**Regra geral do projeto:** comandos `php artisan` / `composer` sempre via
+`docker compose exec app ...` (o host roda PHP 8.3, o Laravel 13 exige 8.4+,
+que só existe na imagem do container). Comandos `npm` sempre direto no host
+(o container não tem Node). Nunca misture os dois.
+
+## 7. Script standalone de leitura (sem Docker)
+
+Via alternativa ao serviço HTTP, para rodar a leitura do gabarito isolada,
+direto no PC com Python (ex.: se o trabalho pedir um script à parte em vez
+da aplicação completa). É o arquivo `ocr-service/ler_gabarito.py` **sozinho**
+— não depende de `omr.py`, FastAPI, Docker nem de nenhum outro arquivo do
+projeto. Basta copiar esse único arquivo para qualquer PC com Python 3.10+:
+
+```bash
+pip install opencv-python-headless numpy
+python3 ler_gabarito.py caminho/para/foto-do-gabarito.png
+```
+
+Testado rodando em container `python:3.12-slim` limpo, só com o arquivo
+`ler_gabarito.py` e as duas dependências acima instaladas via pip.
+
+O script pergunta a alternativa correta de cada questão (guardada só em
+memória, nesta execução), lê a imagem e mostra questão a questão o que foi
+marcado, o que era esperado, e o total de acertos.
+
 ## Comandos úteis
 
 ```bash

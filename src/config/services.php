@@ -35,4 +35,8 @@ return [
         ],
     ],
 
+    'ocr' => [
+        'url' => env('OCR_SERVICE_URL'),
+    ],
+
 ];
