@@ -11,7 +11,11 @@ class ExamSeeder extends Seeder
     {
         $exam = Exam::firstOrCreate(
             ['name' => 'Prova de Teste'],
-            ['questions_count' => 8, 'options_count' => 4],
+            [
+                'description' => 'Prova sintética usada na validação do OMR',
+                'questions_count' => 8,
+                'options_count' => 4,
+            ],
         );
 
         $answerKey = ['D', 'A', 'C', 'B', 'A', 'D', 'B', 'C'];
