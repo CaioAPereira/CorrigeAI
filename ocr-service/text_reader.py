@@ -34,6 +34,25 @@ FIELD_INSET_X_RATIO = 0.01
 # manual pelo professor em vez de ser aceita em silêncio.
 LOW_CONFIDENCE_THRESHOLD = 0.60
 
+# O TrOCR foi treinado em linhas manuscritas isoladas e razoavelmente altas.
+# Recebendo uma tira muito baixa — o campo Nome sai do warp com ~30px — ele
+# passa a "completar" a linha em vez de transcrevê-la, e inventa um ano no
+# fim do nome. Uma altura maior que a do Tesseract compensa isso.
+TROCR_TARGET_HEIGHT = 192
+
+# Penalidade aplicada à confiança do TrOCR quando foi preciso podar
+# alucinação da saída dele: o texto restante pode estar certo, mas o modelo
+# já demonstrou que estava completando em vez de ler.
+TROCR_HALLUCINATION_PENALTY = 0.25
+
+# O TrOCR reporta média de softmax dos tokens gerados e o Tesseract, média da
+# confiança por palavra. São escalas diferentes, e o TrOCR fica *confiante*
+# justamente quando alucina, porque inventar um ano é caminho provável no
+# modelo de linguagem dele. Comparar os dois números crus faz o TrOCR vencer
+# por margem mínima em campo que o Tesseract leu certo, então ele só ganha
+# quando abre uma vantagem real sobre o Tesseract.
+TROCR_WIN_MARGIN = 0.15
+
 _TROCR: tuple = ()
 
 
@@ -55,18 +74,21 @@ class TextResult:
 def read_name(field: np.ndarray) -> TextResult:
     """Lê o campo Nome, que pode vir em letra de forma ou manuscrita.
 
-    Roda os dois motores e devolve o de maior confiança, em vez de exigir que
-    o professor declare de antemão como o aluno escreveu.
+    Roda os dois motores, em vez de exigir que o professor declare de antemão
+    como o aluno escreveu. O Tesseract é o padrão e o TrOCR só assume quando
+    abre vantagem clara (TROCR_WIN_MARGIN): as confianças dos dois não estão
+    na mesma escala, e o TrOCR pontua alto justamente quando alucina.
     """
-    prepared = _prepare(field)
+    printed = _read_with_tesseract(_prepare(field), digits_only=False)
+    handwritten = _read_with_trocr(_prepare_for_trocr(field))
 
-    results = [_read_with_tesseract(prepared, digits_only=False)]
+    if handwritten is None:
+        return printed
 
-    handwritten = _read_with_trocr(field)
-    if handwritten is not None:
-        results.append(handwritten)
+    if handwritten.confidence > printed.confidence + TROCR_WIN_MARGIN:
+        return handwritten
 
-    return max(results, key=lambda result: result.confidence)
+    return printed
 
 
 def read_document_number(field: np.ndarray, expected_digits: int) -> TextResult:
@@ -104,6 +126,31 @@ def _prepare(field: np.ndarray) -> np.ndarray:
     denoised = cv2.bilateralFilter(cropped, 9, 75, 75)
 
     return cv2.threshold(denoised, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)[1]
+
+
+def _prepare_for_trocr(field: np.ndarray) -> np.ndarray:
+    """Recorta a borda e amplia o campo, preservando tom contínuo.
+
+    Não binariza, de propósito: o TrOCR espera imagem natural em escala de
+    cinza e perde acurácia com a entrada limiarizada que o Tesseract prefere.
+    Mas o inset e a ampliação ele também precisava — antes recebia o recorte
+    cru, com a borda impressa junto e a altura original, que é a condição em
+    que ele alucina.
+    """
+    height, width = field.shape[:2]
+
+    inset_y = int(height * FIELD_INSET_Y_RATIO)
+    inset_x = int(width * FIELD_INSET_X_RATIO)
+    cropped = field[inset_y:height - inset_y, inset_x:width - inset_x]
+
+    if cropped.size == 0:
+        cropped = field
+
+    scale = TROCR_TARGET_HEIGHT / max(cropped.shape[0], 1)
+    if scale > 1:
+        cropped = cv2.resize(cropped, None, fx=scale, fy=scale, interpolation=cv2.INTER_CUBIC)
+
+    return cropped
 
 
 def _read_with_tesseract(prepared: np.ndarray, digits_only: bool) -> TextResult:
@@ -159,13 +206,30 @@ def _read_with_trocr(field: np.ndarray) -> TextResult | None:
             return_dict_in_generate=True,
         )
 
-    text = processor.batch_decode(generated.sequences, skip_special_tokens=True)[0].strip()
+    raw = processor.batch_decode(generated.sequences, skip_special_tokens=True)[0].strip()
+    text = _strip_hallucination(raw)
 
     # Confiança = média das probabilidades dos tokens efetivamente gerados.
     scores = torch.stack(generated.scores, dim=1).softmax(-1).max(-1).values
     confidence = float(scores.mean()) if scores.numel() else 0.0
 
+    if text != raw:
+        confidence = max(confidence - TROCR_HALLUCINATION_PENALTY, 0.0)
+
     return TextResult(text, confidence, "trocr")
+
+
+def _strip_hallucination(text: str) -> str:
+    """Remove da leitura do TrOCR o que ele completou em vez de ler.
+
+    Nome de aluno não termina em ano nem começa com letra solta: os dois
+    padrões aparecem de forma sistemática na saída do modelo, inclusive em
+    campo que o Tesseract lê sem erro, e não correspondem a nada na imagem.
+    """
+    cleaned = re.sub(r"[\s,.;:-]*\b\d{4}\s*$", "", text).strip()
+    cleaned = re.sub(r"^[^\w]*(?:\b[A-Za-z]\b[\s.,;:-]+)?", "", cleaned).strip()
+
+    return cleaned or text
 
 
 def _load_trocr():
