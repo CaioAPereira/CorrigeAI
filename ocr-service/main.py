@@ -1,13 +1,13 @@
 """
-CorrigeAI — Serviço de leitura óptica (OMR).
+CorrigeAI — Serviço de leitura do gabarito.
 
-Wrapper HTTP sobre a lógica de leitura em omr.py. Recebe a foto do gabarito
-e devolve, por questão, qual alternativa (A-D) foi marcada — ou null se
-estiver em branco/ilegível.
+Wrapper HTTP sobre a lógica em omr.py. Recebe a foto do gabarito e devolve
+os dados do aluno lidos no cabeçalho (nome, CPF, RG) e, por questão, qual
+alternativa (A-D) foi marcada — ou null se estiver em branco/ilegível.
 """
 from fastapi import FastAPI, File, HTTPException, UploadFile
 
-from omr import OmrError, read_answers_from_bytes
+from omr import OmrError, read_sheet_from_bytes
 
 app = FastAPI(title="CorrigeAI OCR Service")
 
@@ -18,10 +18,10 @@ def health():
 
 
 @app.post("/read")
-async def read(file: UploadFile = File(...)) -> dict[str, str | None]:
+async def read(file: UploadFile = File(...)) -> dict:
     contents = await file.read()
 
     try:
-        return read_answers_from_bytes(contents)
+        return read_sheet_from_bytes(contents)
     except OmrError as e:
         raise HTTPException(status_code=422, detail=str(e))

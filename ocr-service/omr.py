@@ -1,13 +1,15 @@
 """
-CorrigeAI — lógica de leitura óptica (OMR), compartilhada entre o serviço
-HTTP (main.py) e o script standalone de terminal (ler_gabarito.py).
+CorrigeAI — leitura do gabarito.
 
-Localiza a grade de respostas (retângulo que contorna as 8 linhas x 4
-colunas de caixas) numa imagem e devolve, por questão, qual alternativa
-(A-D) foi marcada — ou None se estiver em branco/ilegível.
+Junta as duas metades do problema: a grade de respostas (OMR — célula escura
+ou não) e os campos de texto do cabeçalho (Nome, CPF, RG — OCR de verdade,
+ver text_reader.py). A localização das regiões na foto fica em layout.py.
 """
 import cv2
 import numpy as np
+
+import layout
+import text_reader
 
 QUESTIONS_COUNT = 8
 OPTIONS_COUNT = 4
@@ -21,81 +23,49 @@ CELL_INSET_RATIO = 0.15
 # e a segunda mais escura da linha para considerar a resposta como marcada.
 MIN_DARKNESS_MARGIN = 0.08
 
+# Quantidade de dígitos esperada em cada documento, usada só para avaliar se a
+# leitura é plausível. RG varia por estado; 9 é o formato mais comum (SP).
+CPF_DIGITS = 11
+RG_DIGITS = 9
+
 
 class OmrError(Exception):
     """Erro de leitura do gabarito (grade não localizada, imagem inválida etc.)."""
 
 
+def read_sheet_from_bytes(contents: bytes) -> dict:
+    """Lê a folha inteira: cabeçalho (aluno) + respostas."""
+    try:
+        image = layout.decode_image(contents)
+        regions = layout.find_regions(image)
+    except layout.LayoutError as e:
+        raise OmrError(str(e)) from e
+
+    return {
+        "student": _read_student(regions),
+        "answers": _read_answers(regions["grid"].image),
+    }
+
+
 def read_answers_from_bytes(contents: bytes) -> dict[str, str | None]:
-    image = cv2.imdecode(np.frombuffer(contents, np.uint8), cv2.IMREAD_COLOR)
-
-    if image is None:
-        raise OmrError("Não foi possível decodificar a imagem enviada.")
-
-    grid = _extract_grid(image)
-    return _read_answers(grid)
+    """Compatibilidade: só as respostas, no formato antigo."""
+    return read_sheet_from_bytes(contents)["answers"]
 
 
-def _extract_grid(image: np.ndarray) -> np.ndarray:
-    """Localiza o maior contorno retangular da imagem (a borda da grade de
-    respostas) e devolve a imagem já corrigida de perspectiva, contendo
-    somente essa grade."""
-    gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
-    blurred = cv2.GaussianBlur(gray, (5, 5), 0)
-    _, thresh = cv2.threshold(blurred, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
+def _read_student(regions: dict[str, layout.Region]) -> dict:
+    """Lê Nome, CPF e RG das regiões do cabeçalho que foram localizadas."""
+    student: dict = {}
 
-    contours, _ = cv2.findContours(thresh, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-    if not contours:
-        raise OmrError("Não foi possível localizar a grade de respostas na imagem.")
+    if "name" in regions:
+        student["name"] = text_reader.read_name(regions["name"].image).to_dict()
 
-    largest = max(contours, key=cv2.contourArea)
-    perimeter = cv2.arcLength(largest, True)
-    approx = cv2.approxPolyDP(largest, 0.02 * perimeter, True)
+    for field, expected_digits in (("cpf", CPF_DIGITS), ("rg", RG_DIGITS)):
+        if field in regions:
+            student[field] = text_reader.read_document_number(
+                regions[field].image, expected_digits
+            ).to_dict()
 
-    if len(approx) != 4:
-        raise OmrError("Não foi possível identificar os 4 cantos da grade de respostas.")
-
-    corners = _order_corners(approx.reshape(4, 2).astype(np.float32))
-    width, height = _target_size(corners)
-
-    destination = np.array(
-        [[0, 0], [width - 1, 0], [width - 1, height - 1], [0, height - 1]],
-        dtype=np.float32,
-    )
-    matrix = cv2.getPerspectiveTransform(corners, destination)
-    warped = cv2.warpPerspective(gray, matrix, (width, height))
-
-    return warped
-
-
-def _order_corners(points: np.ndarray) -> np.ndarray:
-    """Ordena 4 pontos como [topo-esquerda, topo-direita, baixo-direita, baixo-esquerda]."""
-    ordered = np.zeros((4, 2), dtype=np.float32)
-
-    sums = points.sum(axis=1)
-    ordered[0] = points[np.argmin(sums)]
-    ordered[2] = points[np.argmax(sums)]
-
-    diffs = np.diff(points, axis=1)
-    ordered[1] = points[np.argmin(diffs)]
-    ordered[3] = points[np.argmax(diffs)]
-
-    return ordered
-
-
-def _target_size(corners: np.ndarray) -> tuple[int, int]:
-    (top_left, top_right, bottom_right, bottom_left) = corners
-
-    width = max(
-        int(np.linalg.norm(top_right - top_left)),
-        int(np.linalg.norm(bottom_right - bottom_left)),
-    )
-    height = max(
-        int(np.linalg.norm(bottom_left - top_left)),
-        int(np.linalg.norm(bottom_right - top_right)),
-    )
-
-    return width, height
+    return student
 
 
 def _read_answers(grid: np.ndarray) -> dict[str, str | None]:

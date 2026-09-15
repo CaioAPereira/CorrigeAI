@@ -55,6 +55,11 @@ curl http://localhost:8000/health   # serviço OCR
 | API do leitor óptico (Swagger) | http://localhost:8000/docs |
 | PostgreSQL (DBeaver) | `localhost:5432` — `corrigeai` / `corrigeai` / `secret` |
 
+> **Primeiro build do serviço OCR demora.** A imagem do `ocr` baixa PyTorch e
+> o modelo de reconhecimento de letra manuscrita (~1.3 GB), então o primeiro
+> `docker compose build ocr` leva vários minutos. O modelo é baixado durante o
+> build, de propósito: assim a primeira correção não trava esperando download.
+
 ## 6. Assets front-end (Node/npm)
 
 **Roda no host (WSL2), nunca dentro do container `app`.** O container `app`
@@ -105,6 +110,18 @@ Testado rodando em container `python:3.12-slim` limpo, só com o arquivo
 O script pergunta a alternativa correta de cada questão (guardada só em
 memória, nesta execução), lê a imagem e mostra questão a questão o que foi
 marcado, o que era esperado, e o total de acertos.
+
+Para ler também Nome/CPF/RG do cabeçalho, instale o Tesseract além do acima:
+
+```bash
+sudo apt install tesseract-ocr tesseract-ocr-por   # Linux
+pip install pytesseract
+```
+
+Sem o Tesseract o script continua corrigindo as respostas normalmente — só
+imprime o cabeçalho como "(não lido)". O script standalone usa apenas
+Tesseract; o reconhecimento de letra cursiva (TrOCR) existe só no serviço
+Docker, para manter este arquivo leve e sem dependência de modelo.
 
 ## Comandos úteis
 

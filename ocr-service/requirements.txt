@@ -3,3 +3,9 @@ uvicorn[standard]==0.34.0
 python-multipart==0.0.20
 opencv-python-headless==4.10.0.84
 numpy==2.2.1
+pytesseract==0.3.13
+pillow==11.1.0
+# torch em versão CPU: a imagem já fica grande, não faz sentido puxar CUDA.
+--extra-index-url https://download.pytorch.org/whl/cpu
+torch==2.5.1
+transformers==4.48.0

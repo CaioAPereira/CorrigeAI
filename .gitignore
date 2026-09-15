@@ -20,6 +20,9 @@ __pycache__/
 /storage/uploads/
 *.local
 
+# Imagens sintéticas de teste (regeráveis via ocr-service/gerar_imagens_teste.py)
+/imagens-teste/
+
 # IDE / SO
 .idea/
 .vscode/

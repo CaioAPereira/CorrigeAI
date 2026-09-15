@@ -10,6 +10,12 @@ restante do projeto — é a via alternativa para quando só o script isolado
 Dependências (instalar antes de rodar):
     pip install opencv-python-headless numpy
 
+    Opcional, para ler também Nome/CPF/RG do cabeçalho:
+        pip install pytesseract
+        e o binário do Tesseract (Linux: apt install tesseract-ocr tesseract-ocr-por;
+        Windows: instalador do UB-Mannheim). Sem isso o script ainda corrige
+        as respostas normalmente, só não identifica o aluno.
+
 Uso:
     python ler_gabarito.py caminho/para/imagem.png
 
@@ -18,6 +24,7 @@ O script pergunta, questão por questão, qual é a alternativa correta
 comparar e mostrar o resultado.
 """
 import argparse
+import re
 import sys
 
 import cv2
@@ -35,41 +42,176 @@ CELL_INSET_RATIO = 0.15
 # e a segunda mais escura da linha para considerar a resposta como marcada.
 MIN_DARKNESS_MARGIN = 0.08
 
+# Faixa de área (em fração da imagem) que um contorno precisa ter para ser
+# considerado um campo do formulário: descarta ruído e a moldura externa.
+MIN_AREA_RATIO = 0.01
+MAX_AREA_RATIO = 0.60
+POLY_EPSILON_RATIO = 0.02
+
+# Preparo do recorte antes do OCR de texto.
+TARGET_HEIGHT = 96
+FIELD_INSET_Y_RATIO = 0.10
+FIELD_INSET_X_RATIO = 0.01
+
+CPF_DIGITS = 11
+RG_DIGITS = 9
+
 
 class OmrError(Exception):
     """Erro de leitura do gabarito (grade não localizada, imagem inválida etc.)."""
 
 
-def read_answers_from_bytes(contents: bytes) -> dict[str, str | None]:
+def read_sheet_from_bytes(contents: bytes) -> dict:
+    """Lê a folha inteira: cabeçalho (aluno) + respostas."""
     image = cv2.imdecode(np.frombuffer(contents, np.uint8), cv2.IMREAD_COLOR)
 
     if image is None:
         raise OmrError("Não foi possível decodificar a imagem enviada.")
 
-    grid = _extract_grid(image)
-    return _read_answers(grid)
+    regions = _find_regions(image)
+
+    return {
+        "student": _read_student(regions),
+        "answers": _read_answers(regions["grid"]),
+    }
 
 
-def _extract_grid(image: np.ndarray) -> np.ndarray:
-    """Localiza o maior contorno retangular da imagem (a borda da grade de
-    respostas) e devolve a imagem já corrigida de perspectiva, contendo
-    somente essa grade."""
+def _find_regions(image: np.ndarray) -> dict[str, np.ndarray]:
+    """Localiza os campos Nome/CPF/RG e a grade de respostas na imagem."""
+    candidates = _find_rectangles(image)
+
+    if not candidates:
+        raise OmrError("Não foi possível localizar a grade de respostas na imagem.")
+
+    grid = _pick_grid(candidates)
+    regions = {"grid": grid[0]}
+
+    _, grid_corners = grid
+    grid_top = grid_corners[0][1]
+
+    above = [
+        (warped, corners) for warped, corners in candidates
+        if corners is not grid_corners and corners.mean(axis=0)[1] < grid_top
+    ]
+
+    if above:
+        by_height = sorted(above, key=lambda item: item[1].mean(axis=0)[1])
+        regions["name"] = by_height[0][0]
+
+        second_row = sorted(by_height[1:], key=lambda item: item[1].mean(axis=0)[0])
+        if len(second_row) >= 1:
+            regions["cpf"] = second_row[0][0]
+        if len(second_row) >= 2:
+            regions["rg"] = second_row[1][0]
+
+    return regions
+
+
+def _find_rectangles(image: np.ndarray) -> list[tuple[np.ndarray, np.ndarray]]:
     gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
     blurred = cv2.GaussianBlur(gray, (5, 5), 0)
     _, thresh = cv2.threshold(blurred, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
 
-    contours, _ = cv2.findContours(thresh, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-    if not contours:
-        raise OmrError("Não foi possível localizar a grade de respostas na imagem.")
+    contours, _ = cv2.findContours(thresh, cv2.RETR_LIST, cv2.CHAIN_APPROX_SIMPLE)
 
-    largest = max(contours, key=cv2.contourArea)
-    perimeter = cv2.arcLength(largest, True)
-    approx = cv2.approxPolyDP(largest, 0.02 * perimeter, True)
+    image_area = float(image.shape[0] * image.shape[1])
+    found: list[tuple[np.ndarray, np.ndarray]] = []
 
-    if len(approx) != 4:
-        raise OmrError("Não foi possível identificar os 4 cantos da grade de respostas.")
+    for contour in contours:
+        area = cv2.contourArea(contour)
 
-    corners = _order_corners(approx.reshape(4, 2).astype(np.float32))
+        if area < image_area * MIN_AREA_RATIO or area > image_area * MAX_AREA_RATIO:
+            continue
+
+        perimeter = cv2.arcLength(contour, True)
+        approx = cv2.approxPolyDP(contour, POLY_EPSILON_RATIO * perimeter, True)
+
+        if len(approx) != 4:
+            continue
+
+        corners = _order_corners(approx.reshape(4, 2).astype(np.float32))
+        found.append((_warp(gray, corners), corners))
+
+    return _deduplicate(found)
+
+
+def _deduplicate(regions: list[tuple[np.ndarray, np.ndarray]]) -> list[tuple[np.ndarray, np.ndarray]]:
+    """Descarta contornos coincidentes (interno/externo da mesma borda)."""
+    kept: list[tuple[np.ndarray, np.ndarray]] = []
+
+    for warped, corners in sorted(regions, key=lambda item: -cv2.contourArea(item[1])):
+        area = cv2.contourArea(corners)
+        center_x, center_y = corners.mean(axis=0)
+        side = np.sqrt(area)
+
+        is_duplicate = False
+        for _, kept_corners in kept:
+            kept_x, kept_y = kept_corners.mean(axis=0)
+            kept_area = cv2.contourArea(kept_corners)
+
+            if (
+                abs(center_x - kept_x) < side * 0.05
+                and abs(center_y - kept_y) < side * 0.05
+                and abs(area - kept_area) < kept_area * 0.25
+            ):
+                is_duplicate = True
+                break
+
+        if not is_duplicate:
+            kept.append((warped, corners))
+
+    return kept
+
+
+def _pick_grid(candidates: list[tuple[np.ndarray, np.ndarray]]) -> tuple[np.ndarray, np.ndarray]:
+    """A grade é o retângulo que contém as 32 caixinhas — não o maior deles.
+
+    No modelo do gabarito a grade fica dentro do bloco "Respostas:", que é
+    maior e igualmente retangular; por isso a escolha é pelo conteúdo.
+    """
+    scored = [
+        (abs(_count_cells(warped) - QUESTIONS_COUNT * OPTIONS_COUNT),
+         cv2.contourArea(corners), warped, corners)
+        for warped, corners in candidates
+    ]
+
+    best_error = min(item[0] for item in scored)
+    best = min((item for item in scored if item[0] == best_error), key=lambda item: item[1])
+
+    return best[2], best[3]
+
+
+def _count_cells(region: np.ndarray) -> int:
+    _, thresh = cv2.threshold(region, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
+    contours, _ = cv2.findContours(thresh, cv2.RETR_LIST, cv2.CHAIN_APPROX_SIMPLE)
+
+    area = float(region.shape[0] * region.shape[1])
+    seen: list[tuple[float, float]] = []
+
+    for contour in contours:
+        contour_area = cv2.contourArea(contour)
+
+        if not (area * 0.004 < contour_area < area * 0.06):
+            continue
+
+        perimeter = cv2.arcLength(contour, True)
+        approx = cv2.approxPolyDP(contour, POLY_EPSILON_RATIO * perimeter, True)
+
+        if len(approx) != 4:
+            continue
+
+        x, y = approx.reshape(-1, 2).mean(axis=0)
+        side = np.sqrt(contour_area)
+
+        if any(abs(x - sx) < side * 0.5 and abs(y - sy) < side * 0.5 for sx, sy in seen):
+            continue
+
+        seen.append((float(x), float(y)))
+
+    return len(seen)
+
+
+def _warp(gray: np.ndarray, corners: np.ndarray) -> np.ndarray:
     width, height = _target_size(corners)
 
     destination = np.array(
@@ -77,9 +219,8 @@ def _extract_grid(image: np.ndarray) -> np.ndarray:
         dtype=np.float32,
     )
     matrix = cv2.getPerspectiveTransform(corners, destination)
-    warped = cv2.warpPerspective(gray, matrix, (width, height))
 
-    return warped
+    return cv2.warpPerspective(gray, matrix, (width, height))
 
 
 def _order_corners(points: np.ndarray) -> np.ndarray:
@@ -109,7 +250,55 @@ def _target_size(corners: np.ndarray) -> tuple[int, int]:
         int(np.linalg.norm(bottom_right - top_right)),
     )
 
-    return width, height
+    return max(width, 1), max(height, 1)
+
+
+def _read_student(regions: dict[str, np.ndarray]) -> dict[str, str | None]:
+    """Lê Nome/CPF/RG. Devolve vazio se o Tesseract não estiver disponível."""
+    student: dict[str, str | None] = {}
+
+    if "name" in regions:
+        student["name"] = _read_text(regions["name"], digits_only=False)
+
+    for field, expected in (("cpf", CPF_DIGITS), ("rg", RG_DIGITS)):
+        if field in regions:
+            text = _read_text(regions[field], digits_only=True)
+            student[field] = re.sub(r"[^0-9./-]", "", text or "").strip("./-") or None
+
+    return student
+
+
+def _read_text(field: np.ndarray, digits_only: bool) -> str | None:
+    try:
+        import pytesseract
+    except ImportError:
+        return None
+
+    height, width = field.shape[:2]
+    inset_y = int(height * FIELD_INSET_Y_RATIO)
+    inset_x = int(width * FIELD_INSET_X_RATIO)
+
+    cropped = field[inset_y:height - inset_y, inset_x:width - inset_x]
+    if cropped.size == 0:
+        cropped = field
+
+    scale = TARGET_HEIGHT / max(cropped.shape[0], 1)
+    if scale > 1:
+        cropped = cv2.resize(cropped, None, fx=scale, fy=scale, interpolation=cv2.INTER_CUBIC)
+
+    denoised = cv2.bilateralFilter(cropped, 9, 75, 75)
+    prepared = cv2.threshold(denoised, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)[1]
+
+    config = "--psm 7"
+    if digits_only:
+        config += " -c tessedit_char_whitelist=0123456789.-/"
+
+    try:
+        text = pytesseract.image_to_string(prepared, lang="por", config=config)
+    except Exception:
+        return None
+
+    return text.strip() or None
 
 
 def _read_answers(grid: np.ndarray) -> dict[str, str | None]:
@@ -185,10 +374,23 @@ def main() -> int:
         contents = file.read()
 
     try:
-        marked_answers = read_answers_from_bytes(contents)
+        sheet = read_sheet_from_bytes(contents)
     except OmrError as e:
         print(f"Erro ao ler o gabarito: {e}", file=sys.stderr)
         return 1
+
+    student = sheet["student"]
+    marked_answers = sheet["answers"]
+
+    if student:
+        print()
+        print("Aluno identificado na folha:")
+        print(f"  Nome: {student.get('name') or '(não lido)'}")
+        print(f"  CPF:  {student.get('cpf') or '(não lido)'}")
+        print(f"  RG:   {student.get('rg') or '(não lido)'}")
+    else:
+        print()
+        print("Cabeçalho não lido (Tesseract não instalado ou campos não localizados).")
 
     correct_count = 0
 
