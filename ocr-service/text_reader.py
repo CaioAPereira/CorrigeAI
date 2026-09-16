@@ -40,6 +40,12 @@ LOW_CONFIDENCE_THRESHOLD = 0.60
 # fim do nome. Uma altura maior que a do Tesseract compensa isso.
 TROCR_TARGET_HEIGHT = 192
 
+# Proporção largura/altura máxima entregue ao TrOCR. O campo sai do warp como
+# uma tira de ~35x640 (aspect ~19:1) e o processador do modelo redimensiona
+# tudo para 384x384 — uma tira dessas chega ao modelo com a escrita esmagada.
+# Acolchoando com o tom do papel até ~6:1, a letra sobrevive ao resize.
+TROCR_MAX_ASPECT = 6.0
+
 # Penalidade aplicada à confiança do TrOCR quando foi preciso podar
 # alucinação da saída dele: o texto restante pode estar certo, mas o modelo
 # já demonstrou que estava completando em vez de ler.
@@ -57,10 +63,13 @@ _TROCR: tuple = ()
 
 
 class TextResult:
-    def __init__(self, text: str, confidence: float, engine: str):
+    def __init__(self, text: str, confidence: float, engine: str, truncated: bool = False):
         self.text = text
         self.confidence = confidence
         self.engine = engine
+        # Leitura que terminou num separador, sinal de que o motor parou antes
+        # do último dígito. Não muda o texto, só impede que ele passe como bom.
+        self.truncated = truncated
 
     def to_dict(self) -> dict:
         return {
@@ -85,27 +94,164 @@ def read_name(field: np.ndarray) -> TextResult:
     if handwritten is None:
         return printed
 
+    # O Tesseract só é o padrão enquanto o que ele devolve ainda parece um
+    # nome. Em cursiva ele produz lixo com pontuação e dígitos ("QU 14) “Abe
+    # or O... an.") e, como a confiança dele é média por palavra, esse lixo
+    # vencia o TrOCR na comparação numérica.
+    if not _looks_like_name(printed.text):
+        return handwritten
+
     if handwritten.confidence > printed.confidence + TROCR_WIN_MARGIN:
         return handwritten
 
     return printed
 
 
-def read_document_number(field: np.ndarray, expected_digits: int) -> TextResult:
-    """Lê CPF ou RG: só dígitos e separadores, sempre via Tesseract.
+def _looks_like_name(text: str) -> bool:
+    """Diz se a leitura ainda é plausível como nome de pessoa.
 
-    O score do Tesseract é pessimista em sequência longa de dígitos — ele não
-    tem contexto de dicionário para se apoiar e reporta confiança baixa mesmo
-    acertando. Então o formato entra no julgamento: se veio a quantidade certa
-    de dígitos, a leitura é plausível e não vira alarme falso de revisão.
+    Não tenta validar o nome — só descartar saída claramente degradada:
+    nome de gente não tem dígito, e é feito majoritariamente de letras.
     """
-    result = _read_with_tesseract(_prepare(field), digits_only=True)
-    text = _clean_document(result.text)
+    stripped = text.strip()
 
-    digits = sum(character.isdigit() for character in text)
-    confidence = max(result.confidence, 0.75) if digits == expected_digits else result.confidence
+    if len(stripped) < 3:
+        return False
 
-    return TextResult(text, confidence, result.engine)
+    if any(character.isdigit() for character in stripped):
+        return False
+
+    # Pontuação no meio do texto denuncia leitura degradada: em nome de pessoa
+    # só aparecem hífen e apóstrofo ("Anna-Maria", "D'Ávila"). Parêntese,
+    # fecha-chave e reticências são lixo do Tesseract tentando ler cursiva.
+    if any(character in "()[]{}<>|\\/*#@_=+~^" for character in stripped):
+        return False
+
+    letters = sum(character.isalpha() or character.isspace() for character in stripped)
+
+    if letters / len(stripped) < 0.8:
+        return False
+
+    # Nome de gente tem palavras; sequência de fragmentos de 1-2 letras é
+    # ruído. Exige que a maior parte das palavras tenha tamanho plausível.
+    words = stripped.split()
+    real_words = sum(len(word) >= 3 for word in words)
+
+    return bool(words) and real_words >= len(words) / 2
+
+
+def read_document_number(field: np.ndarray, expected_digits: tuple[int, int]) -> TextResult:
+    """Lê CPF ou RG, preferindo o motor de manuscrito.
+
+    Na folha real o aluno escreve os documentos à mão, e o Tesseract é um
+    motor de texto impresso: em foto de papel ele perde dígitos de forma
+    consistente (lia "41161-08" para um CPF que o TrOCR transcreve inteiro).
+    Por isso a ordem aqui é o inverso da do Nome — o TrOCR é o padrão, e o
+    Tesseract só entra se o TrOCR estiver indisponível ou devolver uma
+    contagem de dígitos pior.
+
+    A alucinação que obriga a desconfiar do TrOCR no Nome ([[project-ocr-nome-alucinacao]])
+    não tem o mesmo espaço aqui: a saída é validada contra o formato
+    esperado, então completar com texto plausível não passa despercebido.
+    """
+    minimum_digits, maximum_digits = expected_digits
+
+    tesseract = _read_with_tesseract(_prepare(field), digits_only=True)
+    candidates = [
+        TextResult(
+            _clean_document(tesseract.text),
+            tesseract.confidence,
+            "tesseract",
+            _ends_in_separator(tesseract.text),
+        )
+    ]
+
+    handwritten = _read_with_trocr(_prepare_for_trocr(field))
+
+    if handwritten is not None:
+        candidates.insert(
+            0,
+            TextResult(
+                _clean_document(handwritten.text),
+                handwritten.confidence,
+                "trocr",
+                _ends_in_separator(handwritten.text),
+            ),
+        )
+
+    # Vence quem estiver dentro da faixa de dígitos esperada; fora dela, quem
+    # chegar mais perto. Empate fica com o primeiro da lista (o TrOCR, quando
+    # ele rodou). Preferir o MAIS LONGO dentro da faixa é de propósito: o erro
+    # típico dos dois motores é perder dígito no fim, nunca inventar um.
+    best = max(
+        candidates,
+        key=lambda result: (
+            -_digit_distance(result.text, minimum_digits, maximum_digits),
+            _digit_count(result.text),
+        ),
+    )
+
+    digits = _digit_count(best.text)
+
+    # Separador solto no fim ("38.312.468-") é assinatura de leitura cortada:
+    # o modelo chegou a ver o separador mas parou antes do dígito seguinte.
+    # Sem isso a leitura truncada ainda cai dentro da faixa e é aceita em
+    # silêncio — é o pior caso possível, porque um RG errado mas plausível
+    # não chama atenção de quem confere.
+    if best.truncated:
+        return TextResult(best.text, min(best.confidence, 0.4), best.engine)
+
+    plausible = minimum_digits <= digits <= maximum_digits
+
+    if not plausible:
+        return TextResult(best.text, min(best.confidence, 0.4), best.engine)
+
+    # O score bruto do Tesseract é pessimista em sequência longa de dígitos
+    # (não tem dicionário para se apoiar) e reporta ~0 mesmo acertando, então
+    # uma leitura boa cairia em revisão sem necessidade. Mas sustentar a
+    # confiança só porque a CONTAGEM de dígitos bate é perigoso: ter 8 dígitos
+    # não é ter os 8 dígitos certos. Num RG manuscrito lido como "21369392"
+    # (o correto é "394765392") o Tesseract entregava 0.75 — acima do limiar
+    # de revisão — e o professor não tinha motivo para desconfiar de um número
+    # plausível. É o pior erro possível aqui, porque passa silencioso.
+    #
+    # O piso então exige corroboração: os dois motores, que erram de formas
+    # diferentes, chegarem ao mesmo número é evidência real de acerto. Motor
+    # sozinho mantém seu próprio score e, se for baixo, cai em revisão.
+    if _corroborated(candidates, best):
+        return TextResult(best.text, max(best.confidence, 0.75), best.engine)
+
+    return TextResult(best.text, best.confidence, best.engine)
+
+
+def _corroborated(candidates: list[TextResult], best: TextResult) -> bool:
+    """Diz se outro motor chegou ao mesmo número que o escolhido."""
+    return any(
+        other is not best and other.text == best.text and other.text
+        for other in candidates
+    )
+
+
+def _ends_in_separator(text: str) -> bool:
+    """True se a leitura termina em separador, sem dígito depois."""
+    return bool(re.search(r"[.\-/]\s*$", text.strip()))
+
+
+def _digit_count(text: str) -> int:
+    return sum(character.isdigit() for character in text)
+
+
+def _digit_distance(text: str, minimum: int, maximum: int) -> int:
+    """Zero se a contagem de dígitos cabe na faixa; senão, o quanto falta/sobra."""
+    digits = _digit_count(text)
+
+    if digits < minimum:
+        return minimum - digits
+
+    if digits > maximum:
+        return digits - maximum
+
+    return 0
 
 
 def _prepare(field: np.ndarray) -> np.ndarray:
@@ -146,11 +292,34 @@ def _prepare_for_trocr(field: np.ndarray) -> np.ndarray:
     if cropped.size == 0:
         cropped = field
 
+    cropped = _pad_to_aspect(cropped, TROCR_MAX_ASPECT)
+
     scale = TROCR_TARGET_HEIGHT / max(cropped.shape[0], 1)
     if scale > 1:
         cropped = cv2.resize(cropped, None, fx=scale, fy=scale, interpolation=cv2.INTER_CUBIC)
 
     return cropped
+
+
+def _pad_to_aspect(field: np.ndarray, max_aspect: float) -> np.ndarray:
+    """Acolchoa a tira em cima e embaixo até ela caber na proporção alvo.
+
+    O preenchimento usa um tom claro tirado da própria imagem (percentil 90 =
+    o papel), e não branco puro, para não criar uma borda artificial de alto
+    contraste que o modelo leia como traço.
+    """
+    height, width = field.shape[:2]
+
+    if height <= 0 or width / height <= max_aspect:
+        return field
+
+    target_height = int(width / max_aspect)
+    extra = target_height - height
+    paper = int(np.percentile(field, 90))
+
+    return cv2.copyMakeBorder(
+        field, extra // 2, extra - extra // 2, 0, 0, cv2.BORDER_CONSTANT, value=paper
+    )
 
 
 def _read_with_tesseract(prepared: np.ndarray, digits_only: bool) -> TextResult:
@@ -255,9 +424,12 @@ def _load_trocr():
 
 
 def _clean_document(text: str) -> str:
-    """Normaliza CPF/RG: só dígitos e separadores, sem lixo nas pontas.
+    """Normaliza CPF/RG para **só os dígitos**, sem pontos nem traços.
 
-    Sobra de borda costuma virar '-' ou '.' no começo/fim da leitura; separador
-    só faz sentido entre dígitos.
+    Guardar o documento já normalizado é o que permite comparar e futuramente
+    casar com um cadastro de aluno: a mesma pessoa pode escrever o RG com ou
+    sem pontuação, e o OCR ainda por cima erra o separador com frequência
+    (troca '.' por '-' e vice-versa). O dígito é o dado; a máscara é
+    apresentação, e fica a cargo de quem exibe.
     """
-    return re.sub(r"[^0-9./-]", "", text).strip("./-")
+    return re.sub(r"[^0-9]", "", text)

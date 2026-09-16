@@ -55,15 +55,32 @@ def option_letters(options_count: int) -> list[str]:
 
 # Fração da altura/largura da célula usada como margem ao medir o quanto
 # está escura — evita contar as bordas da própria caixa impressa como marcação.
-CELL_INSET_RATIO = 0.15
+CELL_INSET_RATIO = 0.12
 
 # Diferença mínima (em proporção de pixels escuros) entre a célula mais escura
 # e a segunda mais escura da linha para considerar a resposta como marcada.
 MIN_DARKNESS_MARGIN = 0.08
 
+# Tinta mínima dentro da caixinha detectada para considerá-la marcada, e
+# vantagem mínima sobre a segunda. Medindo dentro da borda, célula vazia dá
+# ~0.000, "X" dá ~0.06-0.13 e quadrado pintado dá ~0.99.
+MIN_INK_RATIO = 0.03
+MIN_INK_MARGIN = 0.02
+
+# Duas caixinhas as duas claramente marcadas = questão ambígua (anulada), e
+# não "vale a mais escura": a margem absoluta acima não separa 0.784 de 0.835,
+# que são dois quadrados igualmente pintados pelo aluno. Ver omr.py.
+CLEARLY_MARKED_INK = 0.30
+AMBIGUOUS_INK_RATIO = 0.50
+
+# Threshold adaptativo para achar os retângulos: em foto de papel a luz é
+# desigual e o Otsu global perde a borda dos campos no lado sombreado.
+ADAPTIVE_BLOCK_SIZE = 31
+ADAPTIVE_C = 7
+
 # Faixa de área (em fração da imagem) que um contorno precisa ter para ser
 # considerado um campo do formulário: descarta ruído e a moldura externa.
-MIN_AREA_RATIO = 0.01
+MIN_AREA_RATIO = 0.004
 MAX_AREA_RATIO = 0.60
 POLY_EPSILON_RATIO = 0.02
 
@@ -72,8 +89,10 @@ TARGET_HEIGHT = 96
 FIELD_INSET_Y_RATIO = 0.10
 FIELD_INSET_X_RATIO = 0.01
 
-CPF_DIGITS = 11
-RG_DIGITS = 9
+# Faixa de dígitos de cada documento. O RG varia por estado e o dígito
+# verificador pode ou não vir junto ("38.312.468-2" em SP tem 10).
+CPF_DIGITS = (11, 11)
+RG_DIGITS = (8, 10)
 
 
 class OmrError(Exception):
@@ -133,7 +152,14 @@ def _find_regions(image: np.ndarray, questions_count: int, options_count: int) -
 def _find_rectangles(image: np.ndarray) -> list[tuple[np.ndarray, np.ndarray]]:
     gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
     blurred = cv2.GaussianBlur(gray, (5, 5), 0)
-    _, thresh = cv2.threshold(blurred, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
+    thresh = cv2.adaptiveThreshold(
+        blurred,
+        255,
+        cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+        cv2.THRESH_BINARY_INV,
+        ADAPTIVE_BLOCK_SIZE,
+        ADAPTIVE_C,
+    )
 
     contours, _ = cv2.findContours(thresh, cv2.RETR_LIST, cv2.CHAIN_APPROX_SIMPLE)
 
@@ -295,7 +321,9 @@ def _read_student(regions: dict[str, np.ndarray]) -> dict[str, str | None]:
     for field, expected in (("cpf", CPF_DIGITS), ("rg", RG_DIGITS)):
         if field in regions:
             text = _read_text(regions[field], digits_only=True)
-            student[field] = re.sub(r"[^0-9./-]", "", text or "").strip("./-") or None
+            # Só os dígitos: a máscara é apresentação, o dígito é o dado — e o
+            # OCR erra o separador com frequência (troca '.' por '-').
+            student[field] = re.sub(r"[^0-9]", "", text or "") or None
 
     return student
 
@@ -334,24 +362,117 @@ def _read_text(field: np.ndarray, digits_only: bool) -> str | None:
 
 
 def _read_answers(grid: np.ndarray, questions_count: int, options_count: int) -> dict[str, str | None]:
-    """Devolve a alternativa marcada de cada questão, com a margem de
-    confiança da decisão — é a margem que diz onde calibrar o threshold."""
+    """Devolve a alternativa marcada de cada questão.
+
+    Mede a tinta dentro da caixinha DETECTADA, não numa fatia geométrica da
+    grade: a borda impressa da caixa sozinha já dá ~12% de pixels escuros,
+    enquanto as duas riscas de um "X" acrescentam ~5%. Fatiando, "X" ficava
+    indistinguível de célula vazia e só o quadrado pintado era reconhecido.
+    """
     _, thresh = cv2.threshold(grid, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
 
+    letters = option_letters(options_count)
+    cells = _detect_cells(thresh, questions_count, options_count)
+
+    if cells is None:
+        return _read_answers_by_slicing(thresh, questions_count, options_count, letters)
+
+    answers: dict[str, str | None] = {}
+
+    for row, row_cells in enumerate(cells):
+        ink = [_cell_ink(thresh, box) for box in row_cells]
+        answers[str(row + 1)] = _pick_marked_option(ink, letters)
+
+    return answers
+
+
+def _detect_cells(
+    thresh: np.ndarray, questions_count: int, options_count: int
+) -> list[list[tuple[int, int, int, int]]] | None:
+    """Acha as caixinhas e as organiza em linhas. None se não achar todas."""
+    expected = questions_count * options_count
+
+    contours, _ = cv2.findContours(thresh, cv2.RETR_LIST, cv2.CHAIN_APPROX_SIMPLE)
+
+    area = float(thresh.shape[0] * thresh.shape[1])
+    boxes: list[tuple[int, int, int, int]] = []
+
+    for contour in contours:
+        contour_area = cv2.contourArea(contour)
+
+        if not (area * (0.12 / expected) < contour_area < area * (2.0 / expected)):
+            continue
+
+        perimeter = cv2.arcLength(contour, True)
+        approx = cv2.approxPolyDP(contour, POLY_EPSILON_RATIO * perimeter, True)
+
+        if len(approx) != 4:
+            continue
+
+        boxes.append(cv2.boundingRect(approx))
+
+    # A borda tem espessura e gera contorno por fora e por dentro: fica o
+    # menor de cada par, que é o miolo da caixa, já sem a linha impressa.
+    boxes.sort(key=lambda box: box[2] * box[3])
+    kept: list[tuple[int, int, int, int]] = []
+
+    for x, y, w, h in boxes:
+        cx, cy = x + w / 2, y + h / 2
+
+        if any(
+            abs(cx - (kx + kw / 2)) < kw * 0.5 and abs(cy - (ky + kh / 2)) < kh * 0.5
+            for kx, ky, kw, kh in kept
+        ):
+            continue
+
+        kept.append((x, y, w, h))
+
+    if len(kept) != expected:
+        return None
+
+    kept.sort(key=lambda box: box[1])
+
+    return [
+        sorted(kept[row * options_count:(row + 1) * options_count], key=lambda box: box[0])
+        for row in range(questions_count)
+    ]
+
+
+def _cell_ink(thresh: np.ndarray, box: tuple[int, int, int, int]) -> float:
+    x, y, width, height = box
+
+    inset_x = int(width * CELL_INSET_RATIO)
+    inset_y = int(height * CELL_INSET_RATIO)
+
+    cell = thresh[y + inset_y:y + height - inset_y, x + inset_x:x + width - inset_x]
+
+    if cell.size == 0:
+        return 0.0
+
+    return float(np.count_nonzero(cell)) / float(cell.size)
+
+
+def _read_answers_by_slicing(
+    thresh: np.ndarray, questions_count: int, options_count: int, letters: list[str]
+) -> dict[str, str | None]:
+    """Plano B: fatia a grade em partes iguais quando as caixas não aparecem."""
     height, width = thresh.shape
     cell_height = height / questions_count
     cell_width = width / options_count
 
-    letters = option_letters(options_count)
     answers: dict[str, str | None] = {}
 
     for row in range(questions_count):
-        darkness_by_option = [
+        darkness = [
             _cell_darkness(thresh, row, col, cell_height, cell_width)
             for col in range(options_count)
         ]
+        ordered = sorted(darkness, reverse=True)
 
-        answers[str(row + 1)] = _pick_marked_option(darkness_by_option, letters)
+        if ordered[0] - ordered[1] < MIN_DARKNESS_MARGIN:
+            answers[str(row + 1)] = None
+        else:
+            answers[str(row + 1)] = letters[darkness.index(ordered[0])]
 
     return answers
 
@@ -364,11 +485,19 @@ def _answer_margins(grid: np.ndarray, questions_count: int, options_count: int) 
     """
     _, thresh = cv2.threshold(grid, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
 
+    cells = _detect_cells(thresh, questions_count, options_count)
+    margins: dict[str, float] = {}
+
+    if cells is not None:
+        for row, row_cells in enumerate(cells):
+            ink = sorted((_cell_ink(thresh, box) for box in row_cells), reverse=True)
+            margins[str(row + 1)] = ink[0] - ink[1]
+
+        return margins
+
     height, width = thresh.shape
     cell_height = height / questions_count
     cell_width = width / options_count
-
-    margins: dict[str, float] = {}
 
     for row in range(questions_count):
         darkness = sorted(
@@ -399,15 +528,17 @@ def _cell_darkness(thresh: np.ndarray, row: int, col: int, cell_height: float, c
     return float(np.count_nonzero(cell)) / float(cell.size)
 
 
-def _pick_marked_option(darkness_by_option: list[float], letters: list[str]) -> str | None:
-    sorted_darkness = sorted(darkness_by_option, reverse=True)
-    darkest = sorted_darkness[0]
-    second_darkest = sorted_darkness[1]
+def _pick_marked_option(ink_by_option: list[float], letters: list[str]) -> str | None:
+    ordered = sorted(ink_by_option, reverse=True)
+    strongest, runner_up = ordered[0], ordered[1]
 
-    if darkest - second_darkest < MIN_DARKNESS_MARGIN:
+    if strongest < MIN_INK_RATIO or strongest - runner_up < MIN_INK_MARGIN:
         return None
 
-    return letters[darkness_by_option.index(darkest)]
+    if runner_up >= CLEARLY_MARKED_INK and runner_up > strongest * AMBIGUOUS_INK_RATIO:
+        return None
+
+    return letters[ink_by_option.index(strongest)]
 
 
 def ask_int(prompt: str, default: int, minimum: int, maximum: int) -> int:
@@ -595,7 +726,7 @@ def print_report(
         margin_display = "-"
         if margin is not None:
             margin_display = f"{margin:.3f}"
-            if margin < MIN_DARKNESS_MARGIN * 1.5:
+            if margin < MIN_INK_MARGIN * 1.5:
                 tight_count += 1
                 margin_display += "!"
 
@@ -618,9 +749,9 @@ def print_report(
     if tight_count:
         print(
             f"Atenção: {tight_count} questão(ões) com margem apertada (marcadas com !). "
-            f"Limite atual: {MIN_DARKNESS_MARGIN:.3f}."
+            f"Limite atual: {MIN_INK_MARGIN:.3f}."
         )
-        print("Se alguma delas veio errada, é aqui que se calibra MIN_DARKNESS_MARGIN.")
+        print("Se alguma delas veio errada, é aqui que se calibra MIN_INK_MARGIN.")
 
     print()
 

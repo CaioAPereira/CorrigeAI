@@ -15,7 +15,10 @@ import numpy as np
 
 # Um contorno só é considerado campo se ocupar ao menos essa fração da área da
 # imagem — descarta ruído, texto solto e as caixinhas individuais da grade.
-MIN_AREA_RATIO = 0.01
+# Os campos CPF e RG ocupam ~0.6% da foto, então o piso precisa ficar abaixo
+# disso: com 0.01 (valor anterior) os dois eram descartados antes da
+# classificação e o cabeçalho inteiro vinha vazio.
+MIN_AREA_RATIO = 0.004
 
 # E no máximo essa fração — descarta a moldura externa do formulário inteiro,
 # que também é um retângulo fechado e engloba todos os campos.
@@ -23,6 +26,13 @@ MAX_AREA_RATIO = 0.60
 
 # Tolerância do approxPolyDP ao simplificar o contorno em polígono.
 POLY_EPSILON_RATIO = 0.02
+
+# Parâmetros do threshold adaptativo usado para achar os retângulos.
+# Em foto de papel a iluminação é desigual (sombra de um lado da folha), e um
+# threshold global de Otsu perde as bordas na região mais escura — era por isso
+# que o retângulo do campo Nome não era encontrado em foto real.
+ADAPTIVE_BLOCK_SIZE = 31
+ADAPTIVE_C = 7
 
 # Dimensões da grade de respostas, usadas para reconhecê-la pelo conteúdo.
 QUESTIONS_COUNT = 8
@@ -143,7 +153,14 @@ def _find_rectangles(image: np.ndarray) -> list[Region]:
     """Acha todo contorno de 4 lados com área plausível para ser um campo."""
     gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
     blurred = cv2.GaussianBlur(gray, (5, 5), 0)
-    _, thresh = cv2.threshold(blurred, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
+    thresh = cv2.adaptiveThreshold(
+        blurred,
+        255,
+        cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+        cv2.THRESH_BINARY_INV,
+        ADAPTIVE_BLOCK_SIZE,
+        ADAPTIVE_C,
+    )
 
     # RETR_LIST (e não RETR_EXTERNAL): os campos do topo ficam dentro da
     # moldura externa do formulário, então contornos aninhados importam.
@@ -213,11 +230,26 @@ def _classify_text_fields(candidates: list[Region], grid: Region) -> dict[str, R
 
     by_height = sorted(above_grid, key=lambda region: region.center[1])
 
-    fields = {"name": by_height[0]}
+    # O Nome ocupa a linha inteira; CPF e RG dividem a linha seguinte, então
+    # cada um é bem mais estreito. Quando a foto corta o cabeçalho e sobra um
+    # único campo, tratá-lo como Nome só porque é o mais alto grava o CPF no
+    # campo de nome do aluno, sem qualquer sinal de erro na conferência. Só
+    # aceitamos como Nome um campo largo o bastante para ser a linha inteira.
+    first = by_height[0]
+    rest = by_height[1:]
+
+    if not rest and not _spans_header_row(first, grid):
+        # Campo solto e estreito: é um dos documentos, não o Nome. Sem o par
+        # ao lado não dá para saber se é CPF ou RG pela posição, e chutar
+        # errado é pior do que devolver o cabeçalho vazio — o professor
+        # preenche na conferência.
+        return {}
+
+    fields = {"name": first}
 
     # Nome e a dupla CPF/RG estão em linhas distintas; o que sobra abaixo do
     # Nome é a segunda linha, ordenada da esquerda para a direita.
-    second_row = sorted(by_height[1:], key=lambda region: region.center[0])
+    second_row = sorted(rest, key=lambda region: region.center[0])
 
     if len(second_row) >= 1:
         fields["cpf"] = second_row[0]
@@ -225,6 +257,19 @@ def _classify_text_fields(candidates: list[Region], grid: Region) -> dict[str, R
         fields["rg"] = second_row[1]
 
     return fields
+
+
+def _spans_header_row(region: Region, grid: Region) -> bool:
+    """Diz se a região é larga o bastante para ser a linha inteira do Nome.
+
+    A referência é a largura da grade, que é o elemento mais confiável da
+    folha: ela é sempre localizada, e no modelo tem largura comparável à do
+    campo Nome. CPF e RG, que dividem uma linha, ficam perto da metade disso.
+    """
+    grid_width = abs(grid.corners[1][0] - grid.corners[0][0])
+    region_width = abs(region.corners[1][0] - region.corners[0][0])
+
+    return region_width > grid_width * 0.7
 
 
 def _warp(gray: np.ndarray, corners: np.ndarray) -> np.ndarray:
